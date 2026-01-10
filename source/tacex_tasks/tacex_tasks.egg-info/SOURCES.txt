@@ -1,0 +1,9 @@
+pyproject.toml
+setup.py
+tacex_tasks/__init__.py
+tacex_tasks.egg-info/PKG-INFO
+tacex_tasks.egg-info/SOURCES.txt
+tacex_tasks.egg-info/dependency_links.txt
+tacex_tasks.egg-info/not-zip-safe
+tacex_tasks.egg-info/requires.txt
+tacex_tasks.egg-info/top_level.txt

@@ -1,0 +1,24 @@
+Metadata-Version: 2.4
+Name: tacex_tasks
+Version: 0.1.0
+Summary: Extension containing RL Environments for Tactile Sensing
+Home-page: https://github.com/isaac-sim/IsaacLabExtensionTemplate.git
+Author: Duc
+Maintainer: Duc
+License: MIT
+Keywords: rl,robotics,isaaclab,tacex,tactile,gelsight
+Classifier: Natural Language :: English
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Isaac Sim :: 2023.1.1
+Classifier: Isaac Sim :: 4.5.0
+Requires-Python: >=3.10
+Requires-Dist: pytorch-kinematics
+Dynamic: author
+Dynamic: classifier
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license
+Dynamic: maintainer
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary

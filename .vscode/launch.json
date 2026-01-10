@@ -1,0 +1,38 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+      // 🚀 Local Debug: run the currently open file
+      {
+        "name": "Run: Current File",
+        "type": "python",
+        "request": "launch",
+        "program": "${file}",                      // Run the current editor file
+        "console": "integratedTerminal",
+        "cwd": "${workspaceFolder}",               // Set working directory
+        "env": {
+          "PYTHONPATH": "${workspaceFolder}"       // Ensure local imports work
+        },
+        "justMyCode": false,                       // Allow stepping into libraries
+        // "args": [                // Optional: arguments to the script
+        //     "--config",
+        //     "config.json",
+        // ],
+        // "preLaunchTask": "your-task-name"       // Optional: run task before launch
+      },
+
+      // 🐞 Remote Debug: attach to a running debugpy process
+      {
+        "name": "Attach: debugpy Remote",
+        "type": "python",
+        "request": "attach",
+        "connect": {
+          "host": "localhost",
+          "port": 5679                             // Ensure debugpy is listening on this port
+        },
+        "justMyCode": false,
+        "cwd": "${workspaceFolder}",               // Optional but good for resolving source
+      }
+
+    ]
+  }

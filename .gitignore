@@ -1,0 +1,6 @@
+data*/
+logs/
+outputs/
+scripts/benchmarking/
+scripts/demos/
+__pycache__/
