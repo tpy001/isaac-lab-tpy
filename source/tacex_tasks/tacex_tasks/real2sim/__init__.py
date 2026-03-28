@@ -6,39 +6,39 @@
 import gymnasium as gym
 
 from . import agents
-from .forge_env import ForgeEnv
-from .forge_env_cfg import ForgeTaskGearMeshCfg, ForgeTaskNutThreadCfg, ForgeTaskPegInsertCfg
+from .realsim_env import RealSimEnv
+from .realsim_env_cfg import RealSimTaskPegInsertCfg, RealSimTaskGearMeshCfg, RealSimTaskNutThreadCfg
 
 ##
 # Register Gym environments.
 ##
 
 gym.register(
-    id="TacEx-Forge-PegInsert-Direct-v0",
-    entry_point=f"{__name__}.forge_env:ForgeEnv",
+    id="TacEx-RealSim-PegInsert-Direct-v0",
+    entry_point=f"{__name__}.realsim_env:RealSimEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": ForgeTaskPegInsertCfg,
+        "env_cfg_entry_point": RealSimTaskPegInsertCfg,
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
     },
 )
 
 gym.register(
-    id="TacEx-Forge-GearMesh-Direct-v0",
-    entry_point=f"{__name__}.forge_env:ForgeEnv",
+    id="TacEx-RealSim-GearMesh-Direct-v0",
+    entry_point=f"{__name__}.realsim_env:RealSimEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": ForgeTaskGearMeshCfg,
+        "env_cfg_entry_point": RealSimTaskGearMeshCfg,
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
     },
 )
 
 gym.register(
-    id="TacEx-Forge-NutThread-Direct-v0",
-    entry_point=f"{__name__}.forge_env:ForgeEnv",
+    id="TacEx-RealSim-NutThread-Direct-v0",
+    entry_point=f"{__name__}.realsim_env:RealSimEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": ForgeTaskNutThreadCfg,
+        "env_cfg_entry_point": RealSimTaskNutThreadCfg,
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg_nut_thread.yaml",
     },
 )
