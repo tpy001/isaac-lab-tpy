@@ -46,7 +46,10 @@ class PI0RemotePolicy():
     @torch.no_grad()  # Inference should be done without gradients
     def select_action(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         if self.config.temporal_ensemble_coeff is not None:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            actions = self.predict_action_chunk(batch)
+            if actions is None:
+                raise RuntimeError("Remote inference returned None (see previous error logs).")
+            actions = actions[:, : self.config.n_action_steps]
             # print(">>> [select_action] actions chunk (temporal_ensemble branch)")
             # print("    chunk shape:", tuple(actions.shape))   # 比如 (1, 32, 7)
             action = self.temporal_ensembler.update(actions)
@@ -54,7 +57,10 @@ class PI0RemotePolicy():
          
         if len(self._action_queue) == 0:
             assert batch["observation.state"].shape[0] == 1, "Batch size should be 1 for remote inference."
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            actions = self.predict_action_chunk(batch)
+            if actions is None:
+                raise RuntimeError("Remote inference returned None (see previous error logs).")
+            actions = actions[:, : self.config.n_action_steps]
             # print(">>> [select_action] actions chunk (temporal_ensemble branch)")
             # print("    chunk shape:", tuple(actions.shape))   # 比如 (1, 32, 7)
             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue

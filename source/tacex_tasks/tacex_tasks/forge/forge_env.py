@@ -16,6 +16,8 @@ from .forge_env_cfg import ForgeEnvCfg
 from isaaclab.sensors import TiledCamera
 import isaacsim.core.utils.torch as torch_utils
 from isaaclab_tasks.direct.factory import factory_utils
+import isaaclab.sim as sim_utils
+import carb
 
 
 
@@ -53,16 +55,30 @@ class ForgeEnv(IsaacForgeEnv):
         """
         super().__init__(cfg, render_mode, **kwargs)
         
+        # 创建一个专用的随机数生成器
+        # 这里的 seed 可以从 cfg 读取，或者固定
+        seed = self.cfg.seed if hasattr(self.cfg, "seed") and self.cfg.seed is not None else 42
+        self.rng = torch.Generator(device=self.device)
+        self.rng.manual_seed(seed)
+        
+        
         # ========== 新增: Policy初始化 ==========
         if cfg.policy_cfg:
+            # 根据配置类型选择对应的远程策略：
+            # - PI0RemoteConfig -> PI0RemotePolicy（无历史 effort）
+            # - PI0RemoteTAVLAConfig -> PI0RemotePolicyTAVLA（带历史 effort）
+            from .policy.configuration_pi0remote import PI0RemoteConfig as _CfgBase, PI0RemoteTAVLAConfig as _CfgTavla
             from .policy.modeling_pi0remote import PI0RemotePolicy, PI0RemotePolicyTAVLA
-            # 根据配置选择policy类型
-            if hasattr(cfg.policy_cfg, 'num_history_steps'):
+            if isinstance(cfg.policy_cfg, _CfgTavla):
                 self.policy = PI0RemotePolicyTAVLA(cfg.policy_cfg)
+                print("Using Pi0 TAVLA Policy")
+            elif isinstance(cfg.policy_cfg, _CfgBase):
+                self.policy = PI0RemotePolicy(cfg.policy_cfg)
                 print("Using Pi0 Policy")
             else:
+                # 兜底：未知配置类型时，仍按基础 PI0RemotePolicy 处理
                 self.policy = PI0RemotePolicy(cfg.policy_cfg)
-                print("Using TA-VLA Policy")
+                print("Using Pi0 Policy (fallback)")
         else:
             self.policy = None
         
@@ -99,7 +115,9 @@ class ForgeEnv(IsaacForgeEnv):
         
         self.success_times = 0
         self.total_times = 0
-
+        # episode_start flag for episode-streaming style policies (CPU-side, one bool per env)
+        self._episode_start = torch.ones((self.num_envs,), dtype=torch.bool, device="cpu")
+        
     def _setup_scene(self):
         super()._setup_scene()
         # sensors
@@ -461,6 +479,10 @@ class ForgeEnv(IsaacForgeEnv):
                         print("Task Failed!")
                         self.save_data_to_disk(env_ids)
                         self.reset_data_buffer(env_ids)
+                    else:
+                        # Failed trajectory is intentionally not saved, but buffer
+                        # must still be cleared to avoid mixing with next episode.
+                        self.reset_data_buffer(env_ids)
 
             self._reset_idx(reset_env_ids)
             avg_reward = self.reward_buf.mean()
@@ -661,14 +683,22 @@ class ForgeEnv(IsaacForgeEnv):
             batch_input = {
                 "observation.images.front": head_img_tensor,
                 "observation.images.left_wrist": wrist_img_tensor,
+                # Backward/remote-server compatible aliases:
+                "observation.images.head_camera": head_img_tensor,
+                "observation.images.wrist_left_camera": wrist_img_tensor,
                 "observation.state": _state,
                 "observation.effort": effort,
                 "task": prompt_data,
+                # For episode streaming: True only on the first step after reset (per env).
+                "episode_start": torch.tensor([bool(self._episode_start[env_idx].item())], dtype=torch.bool),
             }
             
             # 调用policy推理
             next_action = policy.select_action(batch_input)
             action_list.append(next_action)
+            # consume episode_start after first use
+            if self._episode_start[env_idx]:
+                self._episode_start[env_idx] = False
         
         return action_list
     
@@ -679,4 +709,263 @@ class ForgeEnv(IsaacForgeEnv):
         # ========== 新增: 重置policy状态 ==========
         if hasattr(self, 'policy') and self.policy is not None:
             self.policy.reset()
-        # =========================================
+    
+    def randomize_initial_state(self, env_ids):
+        """Randomize initial state and perform any episode-level randomization."""
+        # Disable gravity.
+        physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
+        physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
+
+        # (1.) Randomize fixed asset pose.
+        fixed_state = self._fixed_asset.data.default_root_state.clone()[env_ids]
+        # (1.a.) Position
+        # [MODIFIED] 使用局部生成器 self.rng
+        rand_sample = torch.rand((len(env_ids), 3), generator=self.rng, dtype=torch.float32, device=self.device)
+        
+        fixed_pos_init_rand = 2 * (rand_sample - 0.5)  # [-1, 1]
+        fixed_asset_init_pos_rand = torch.tensor(
+            self.cfg_task.fixed_asset_init_pos_noise, dtype=torch.float32, device=self.device
+        )
+        fixed_pos_init_rand = fixed_pos_init_rand @ torch.diag(fixed_asset_init_pos_rand)
+        fixed_state[:, 0:3] += fixed_pos_init_rand + self.scene.env_origins[env_ids]
+        # (1.b.) Orientation
+        fixed_orn_init_yaw = np.deg2rad(self.cfg_task.fixed_asset_init_orn_deg)
+        fixed_orn_yaw_range = np.deg2rad(self.cfg_task.fixed_asset_init_orn_range_deg)
+        
+        # [MODIFIED] 使用局部生成器 self.rng
+        rand_sample = torch.rand((len(env_ids), 3), generator=self.rng, dtype=torch.float32, device=self.device)
+        
+        fixed_orn_euler = fixed_orn_init_yaw + fixed_orn_yaw_range * rand_sample
+        fixed_orn_euler[:, 0:2] = 0.0  # Only change yaw.
+        fixed_orn_quat = torch_utils.quat_from_euler_xyz(
+            fixed_orn_euler[:, 0], fixed_orn_euler[:, 1], fixed_orn_euler[:, 2]
+        )
+        fixed_state[:, 3:7] = fixed_orn_quat
+        # (1.c.) Velocity
+        fixed_state[:, 7:] = 0.0  # vel
+        # (1.d.) Update values.
+        self._fixed_asset.write_root_pose_to_sim(fixed_state[:, 0:7], env_ids=env_ids)
+        self._fixed_asset.write_root_velocity_to_sim(fixed_state[:, 7:], env_ids=env_ids)
+        self._fixed_asset.reset()
+
+        # (1.e.) Noisy position observation.
+        # [MODIFIED] 使用局部生成器 self.rng
+        fixed_asset_pos_noise = torch.randn((len(env_ids), 3), generator=self.rng, dtype=torch.float32, device=self.device)
+        
+        fixed_asset_pos_rand = torch.tensor(self.cfg.obs_rand.fixed_asset_pos, dtype=torch.float32, device=self.device)
+        fixed_asset_pos_noise = fixed_asset_pos_noise @ torch.diag(fixed_asset_pos_rand)
+        self.init_fixed_pos_obs_noise[:] = fixed_asset_pos_noise
+
+        self.step_sim_no_action()
+
+        # Compute the frame on the bolt that would be used as observation: fixed_pos_obs_frame
+        # For example, the tip of the bolt can be used as the observation frame
+        fixed_tip_pos_local = torch.zeros((self.num_envs, 3), device=self.device)
+        fixed_tip_pos_local[:, 2] += self.cfg_task.fixed_asset_cfg.height
+        fixed_tip_pos_local[:, 2] += self.cfg_task.fixed_asset_cfg.base_height
+        if self.cfg_task.name == "gear_mesh":
+            fixed_tip_pos_local[:, 0] = self.cfg_task.fixed_asset_cfg.medium_gear_base_offset[0]
+
+        _, fixed_tip_pos = torch_utils.tf_combine(
+            self.fixed_quat,
+            self.fixed_pos,
+            torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
+            fixed_tip_pos_local,
+        )
+        self.fixed_pos_obs_frame[:] = fixed_tip_pos
+
+        # (2) Move gripper to randomizes location above fixed asset. Keep trying until IK succeeds.
+        # (a) get position vector to target
+        bad_envs = env_ids.clone()
+        ik_attempt = 0
+
+        hand_down_quat = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        while True:
+            n_bad = bad_envs.shape[0]
+
+            above_fixed_pos = fixed_tip_pos.clone()
+            above_fixed_pos[:, 2] += self.cfg_task.hand_init_pos[2]
+
+            # [MODIFIED] 使用局部生成器 self.rng
+            rand_sample = torch.rand((n_bad, 3), generator=self.rng, dtype=torch.float32, device=self.device)
+            
+            above_fixed_pos_rand = 2 * (rand_sample - 0.5)  # [-1, 1]
+            hand_init_pos_rand = torch.tensor(self.cfg_task.hand_init_pos_noise, device=self.device)
+            above_fixed_pos_rand = above_fixed_pos_rand @ torch.diag(hand_init_pos_rand)
+            above_fixed_pos[bad_envs] += above_fixed_pos_rand
+
+            # (b) get random orientation facing down
+            hand_down_euler = (
+                torch.tensor(self.cfg_task.hand_init_orn, device=self.device).unsqueeze(0).repeat(n_bad, 1)
+            )
+
+            # [MODIFIED] 使用局部生成器 self.rng
+            rand_sample = torch.rand((n_bad, 3), generator=self.rng, dtype=torch.float32, device=self.device)
+            
+            above_fixed_orn_noise = 2 * (rand_sample - 0.5)  # [-1, 1]
+            hand_init_orn_rand = torch.tensor(self.cfg_task.hand_init_orn_noise, device=self.device)
+            above_fixed_orn_noise = above_fixed_orn_noise @ torch.diag(hand_init_orn_rand)
+            hand_down_euler += above_fixed_orn_noise
+            hand_down_quat[bad_envs, :] = torch_utils.quat_from_euler_xyz(
+                roll=hand_down_euler[:, 0], pitch=hand_down_euler[:, 1], yaw=hand_down_euler[:, 2]
+            ) 
+
+            # (c) iterative IK Method
+            pos_error, aa_error = self.set_pos_inverse_kinematics(
+                ctrl_target_fingertip_midpoint_pos=above_fixed_pos,
+                ctrl_target_fingertip_midpoint_quat=hand_down_quat,
+                env_ids=bad_envs,
+            )
+            pos_error = torch.linalg.norm(pos_error, dim=1) > 1e-3
+            angle_error = torch.norm(aa_error, dim=1) > 1e-3
+            any_error = torch.logical_or(pos_error, angle_error)
+            bad_envs = bad_envs[any_error.nonzero(as_tuple=False).squeeze(-1)]
+
+            # Check IK succeeded for all envs, otherwise try again for those envs
+            if bad_envs.shape[0] == 0:
+                break
+
+            self._set_franka_to_default_pose(
+                joints=[0.00871, -0.10368, -0.00794, -1.49139, -0.00083, 1.38774, 0.0], env_ids=bad_envs
+            )
+
+            ik_attempt += 1
+
+        self.step_sim_no_action()
+
+        # Add flanking gears after servo (so arm doesn't move them).
+        if self.cfg_task.name == "gear_mesh" and self.cfg_task.add_flanking_gears:
+            small_gear_state = self._small_gear_asset.data.default_root_state.clone()[env_ids]
+            small_gear_state[:, 0:7] = fixed_state[:, 0:7]
+            small_gear_state[:, 7:] = 0.0  # vel
+            self._small_gear_asset.write_root_pose_to_sim(small_gear_state[:, 0:7], env_ids=env_ids)
+            self._small_gear_asset.write_root_velocity_to_sim(small_gear_state[:, 7:], env_ids=env_ids)
+            self._small_gear_asset.reset()
+
+            large_gear_state = self._large_gear_asset.data.default_root_state.clone()[env_ids]
+            large_gear_state[:, 0:7] = fixed_state[:, 0:7]
+            large_gear_state[:, 7:] = 0.0  # vel
+            self._large_gear_asset.write_root_pose_to_sim(large_gear_state[:, 0:7], env_ids=env_ids)
+            self._large_gear_asset.write_root_velocity_to_sim(large_gear_state[:, 7:], env_ids=env_ids)
+            self._large_gear_asset.reset()
+
+        # (3) Randomize asset-in-gripper location.
+        # flip gripper z orientation
+        flip_z_quat = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+        fingertip_flipped_quat, fingertip_flipped_pos = torch_utils.tf_combine(
+            q1=self.fingertip_midpoint_quat,
+            t1=self.fingertip_midpoint_pos,
+            q2=flip_z_quat,
+            t2=torch.zeros((self.num_envs, 3), device=self.device),
+        )
+
+        # get default gripper in asset transform
+        held_asset_relative_pos, held_asset_relative_quat = self.get_handheld_asset_relative_pose()
+        asset_in_hand_quat, asset_in_hand_pos = torch_utils.tf_inverse(
+            held_asset_relative_quat, held_asset_relative_pos
+        )
+
+        translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
+            q1=fingertip_flipped_quat, t1=fingertip_flipped_pos, q2=asset_in_hand_quat, t2=asset_in_hand_pos
+        )
+
+        # Add asset in hand randomization
+        # [MODIFIED] 使用局部生成器 self.rng
+
+        rand_sample = torch.rand((self.num_envs, 3), generator=self.rng, dtype=torch.float32, device=self.device)
+        
+        held_asset_pos_noise = 2 * (rand_sample - 0.5)  # [-1, 1]
+        if self.cfg_task.name == "gear_mesh":
+            held_asset_pos_noise[:, 2] = -rand_sample[:, 2]  # [-1, 0]
+
+        held_asset_pos_noise_level = torch.tensor(self.cfg_task.held_asset_pos_noise, device=self.device)
+        held_asset_pos_noise = held_asset_pos_noise @ torch.diag(held_asset_pos_noise_level)
+        
+        # Apply configurable peg-in-gripper rotation noise for peg insertion.
+        if self.cfg_task.name == "peg_insert":
+            rot_noise_deg = float(getattr(self.cfg, "peg_insert_rot_noise_deg", 0.0))
+            rot_noise_rad = np.deg2rad(rot_noise_deg)
+            
+            # [MODIFIED] 使用局部生成器 self.rng
+            rand_rot_sample = torch.rand((self.num_envs, 3), generator=self.rng, dtype=torch.float32, device=self.device)
+            
+            held_asset_rpy_noise = 2 * (rand_rot_sample - 0.5) * rot_noise_rad 
+
+            # 转换为四元数
+            held_asset_rot_noise_quat = torch_utils.quat_from_euler_xyz(
+                held_asset_rpy_noise[:, 0], 
+                held_asset_rpy_noise[:, 1], 
+                held_asset_rpy_noise[:, 2]
+            )
+
+            # 3. 第一步结合：将噪声施加到夹爪坐标系上
+            # 这一步得到的是一个“带有误差的夹爪中心位姿”
+            noisy_gripper_quat, noisy_gripper_pos = torch_utils.tf_combine(
+                q1=fingertip_flipped_quat, 
+                t1=fingertip_flipped_pos, 
+                q2=held_asset_rot_noise_quat,   # 在夹爪中心施加旋转
+                t2=held_asset_pos_noise         # 在夹爪中心施加位移
+            )
+
+            # 4. 第二步结合：加上物体相对于夹爪的固定偏移
+            # 因为前一步旋转了坐标系，这一步的偏移向量会跟着旋转，从而实现“绕点旋转”
+            translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
+                q1=noisy_gripper_quat, 
+                t1=noisy_gripper_pos, 
+                q2=asset_in_hand_quat, 
+                t2=asset_in_hand_pos
+            )
+            print("随机位置和旋转")
+        else:
+            translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
+                q1=translated_held_asset_quat,
+                t1=translated_held_asset_pos,
+                q2=torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
+                t2=held_asset_pos_noise,
+            )
+            
+
+        held_state = self._held_asset.data.default_root_state.clone()
+        held_state[:, 0:3] = translated_held_asset_pos + self.scene.env_origins
+        held_state[:, 3:7] = translated_held_asset_quat
+        held_state[:, 7:] = 0.0
+        self._held_asset.write_root_pose_to_sim(held_state[:, 0:7])
+        self._held_asset.write_root_velocity_to_sim(held_state[:, 7:])
+        self._held_asset.reset()
+
+        #  Close hand
+        # Set gains to use for quick resets.
+        reset_task_prop_gains = torch.tensor(self.cfg.ctrl.reset_task_prop_gains, device=self.device).repeat(
+            (self.num_envs, 1)
+        )
+        self.task_prop_gains = reset_task_prop_gains
+        self.task_deriv_gains = factory_utils.get_deriv_gains(
+            reset_task_prop_gains, self.cfg.ctrl.reset_rot_deriv_scale
+        )
+
+        self.step_sim_no_action()
+
+        grasp_time = 0.0
+        while grasp_time < 0.25:
+            self.ctrl_target_joint_pos[env_ids, 7:] = 0.0  # Close gripper.
+            self.close_gripper_in_place()
+            self.step_sim_no_action()
+            grasp_time += self.sim.get_physics_dt()
+
+        self.prev_joint_pos = self.joint_pos[:, 0:7].clone()
+        self.prev_fingertip_pos = self.fingertip_midpoint_pos.clone()
+        self.prev_fingertip_quat = self.fingertip_midpoint_quat.clone()
+
+        # Set initial actions to involve no-movement. Needed for EMA/correct penalties.
+        self.actions = torch.zeros_like(self.actions)
+        self.prev_actions = torch.zeros_like(self.actions)
+
+        # Zero initial velocity.
+        self.ee_angvel_fd[:, :] = 0.0
+        self.ee_linvel_fd[:, :] = 0.0
+
+        # Set initial gains for the episode.
+        self.task_prop_gains = self.default_gains
+        self.task_deriv_gains = factory_utils.get_deriv_gains(self.default_gains)
+
+        physics_sim_view.set_gravity(carb.Float3(*self.cfg.sim.gravity))
