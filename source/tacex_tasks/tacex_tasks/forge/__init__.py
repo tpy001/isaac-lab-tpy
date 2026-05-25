@@ -7,7 +7,7 @@ import gymnasium as gym
 
 from . import agents
 from .forge_env import ForgeEnv
-from .forge_env_cfg import ForgeTaskGearMeshCfg, ForgeTaskNutThreadCfg, ForgeTaskPegInsertCfg
+from .forge_env_cfg import ForgeTaskGearMeshCfg, ForgeTaskNutThreadCfg, ForgeTaskPegInsertCfg,ForgeTaskGearAssemblyCfg,ForgeTaskPegSquareInsertCfg
 
 ##
 # Register Gym environments.
@@ -24,11 +24,31 @@ gym.register(
 )
 
 gym.register(
+    id="TacEx-Forge-PegSquareInsert-Direct-v0",
+    entry_point=f"{__name__}.forge_env:ForgeEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": ForgeTaskPegSquareInsertCfg,
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
     id="TacEx-Forge-GearMesh-Direct-v0",
     entry_point=f"{__name__}.forge_env:ForgeEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": ForgeTaskGearMeshCfg,
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="TacEx-Forge-GearAssembly-Direct-v0",
+    entry_point=f"{__name__}.forge_env:ForgeEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": ForgeTaskGearAssemblyCfg,
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
     },
 )

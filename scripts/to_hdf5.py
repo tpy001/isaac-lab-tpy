@@ -96,7 +96,8 @@ def process_episode(episode_path: Path, h5_file: h5py.File, desired_joints: list
         gripper = robot_joints_df.to_numpy()[:, -1]  
         robot_state = pd.read_csv(episode_path / 'ee_pose.csv')
         robot_state = np.concatenate((robot_state.to_numpy(), gripper.reshape(-1, 1)), axis=1)
-        force_path = episode_path / 'force.csv'
+        # force_path = episode_path / 'force.csv'
+        force_path = episode_path / 'force_local.csv'
         if force_path.exists():
             force_data = pd.read_csv(force_path).to_numpy()
 

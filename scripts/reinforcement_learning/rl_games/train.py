@@ -25,6 +25,12 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to model checkpoint.")
+parser.add_argument(
+    "--init-checkpoint",
+    type=str,
+    default=None,
+    help="Path to model checkpoint used only to initialize weights/stats for a fresh training run.",
+)
 parser.add_argument("--sigma", type=str, default=None, help="The policy's initial standard deviation.")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument("--wandb-project-name", type=str, default=None, help="the wandb's project name")
@@ -59,11 +65,13 @@ import gymnasium as gym
 import math
 import os
 import random
+import torch
 from datetime import datetime
 
 from rl_games.common import env_configurations, vecenv
 from rl_games.common.algo_observer import IsaacAlgoObserver
 from rl_games.torch_runner import Runner
+from rl_games.algos_torch import torch_ext
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -85,7 +93,7 @@ import tacex_tasks  # noqa: F401
 
 def debug():
     import debugpy
-    debugpy.listen(("0.0.0.0", 5678))
+    debugpy.listen(("0.0.0.0", 5679))
     print("✅ Waiting for debugger to attach on port 5678...")
     debugpy.wait_for_client()
 
@@ -94,6 +102,9 @@ def debug():
 @hydra_task_config(args_cli.task, "rl_games_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: dict):
     """Train with RL-Games agent."""
+    if args_cli.checkpoint is not None and args_cli.init_checkpoint is not None:
+        raise ValueError("Use only one of --checkpoint or --init-checkpoint.")
+
     # override configurations with non-hydra CLI arguments
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
@@ -111,6 +122,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         agent_cfg["params"]["load_checkpoint"] = True
         agent_cfg["params"]["load_path"] = resume_path
         print(f"[INFO]: Loading model checkpoint from: {agent_cfg['params']['load_path']}")
+    init_path = None
+    if args_cli.init_checkpoint is not None:
+        init_path = retrieve_file_path(args_cli.init_checkpoint)
+        print(f"[INFO]: Initializing model weights from checkpoint: {init_path}")
     train_sigma = float(args_cli.sigma) if args_cli.sigma is not None else None
 
     # multi-gpu training config
@@ -207,7 +222,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         wandb.config.update({"env_cfg": env_cfg.to_dict()})
         wandb.config.update({"agent_cfg": agent_cfg})
 
-    if args_cli.checkpoint is not None:
+    if init_path is not None:
+        agent = runner.algo_factory.create(runner.algo_name, base_name="run", params=runner.params)
+        init_checkpoint = torch_ext.load_checkpoint(init_path)
+        agent.set_weights(init_checkpoint)
+        if agent.has_central_value and "assymetric_vf_nets" in init_checkpoint:
+            agent.central_value_net.load_state_dict(init_checkpoint["assymetric_vf_nets"])
+        if train_sigma is not None:
+            net = agent.model.a2c_network
+            if hasattr(net, "sigma") and hasattr(net, "fixed_sigma") and net.fixed_sigma:
+                with torch.no_grad():
+                    net.sigma.fill_(train_sigma)
+        agent.train()
+    elif args_cli.checkpoint is not None:
         runner.run({"train": True, "play": False, "sigma": train_sigma, "checkpoint": resume_path})
     else:
         runner.run({"train": True, "play": False, "sigma": train_sigma})

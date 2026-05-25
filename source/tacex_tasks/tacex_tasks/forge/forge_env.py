@@ -6,6 +6,7 @@
 import numpy as np
 import torch
 import os
+import shutil
 from PIL import Image
 import csv
 import cv2
@@ -15,9 +16,11 @@ from .isaac_forge_env import ForgeEnv as IsaacForgeEnv
 from .forge_env_cfg import ForgeEnvCfg
 from isaaclab.sensors import TiledCamera
 import isaacsim.core.utils.torch as torch_utils
-from isaaclab_tasks.direct.factory import factory_utils
+from isaaclab_tasks.direct.factory import factory_control, factory_utils
 import isaaclab.sim as sim_utils
 import carb
+from .utils import MotionPolicy,PoseTrajectoryPlanner
+from isaaclab.markers import FRAME_MARKER_CFG, VisualizationMarkers
 
 
 
@@ -93,7 +96,31 @@ class ForgeEnv(IsaacForgeEnv):
 
         self.output_dir = output_dir
 
-        
+        self.motion_planner = None
+        self.motion_planner_last_action = None
+        self.motion_planner_active = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        self.motion_planner_target_ee = torch.zeros((self.num_envs, 7), dtype=torch.float32, device=self.device)
+        self.debug_motion_planner = bool(getattr(self.cfg, "debug_motion_planner", False))
+        self.debug_motion_planner_print_interval = int(getattr(self.cfg, "debug_motion_planner_print_interval", 20))
+        self.debug_motion_planner_visualize = bool(getattr(self.cfg, "debug_motion_planner_visualize", True))
+        self.planner_to_rl_handoff = bool(getattr(self.cfg, "planner_to_rl_handoff", True))
+        self.planner_to_rl_pos_tol = float(getattr(self.cfg, "planner_to_rl_pos_tol", 0.05))
+        self.planner_to_rl_rot_tol = float(
+            np.deg2rad(getattr(self.cfg, "planner_to_rl_rot_tol_deg", 60.0))
+        )
+        self.motion_planner_debug = {
+            "valid": torch.zeros((self.num_envs,), dtype=torch.bool, device="cpu"),
+            "cur_ee_pose": torch.zeros((self.num_envs, 7), dtype=torch.float32, device="cpu"),
+            "target_ee_pose": torch.zeros((self.num_envs, 7), dtype=torch.float32, device="cpu"),
+            "target_held_pose": torch.zeros((self.num_envs, 7), dtype=torch.float32, device="cpu"),
+            "fixed_pose": torch.zeros((self.num_envs, 7), dtype=torch.float32, device="cpu"),
+            "held_to_tcp_pose": torch.zeros((self.num_envs, 7), dtype=torch.float32, device="cpu"),
+            "next_action": torch.zeros((self.num_envs, 8), dtype=torch.float32, device="cpu"),
+            "ctrl_target_pose": torch.zeros((self.num_envs, 7), dtype=torch.float32, device="cpu"),
+            "joint_pos": torch.zeros((self.num_envs, 7), dtype=torch.float32, device="cpu"),
+            "ctrl_target_joint_pos": torch.zeros((self.num_envs, 7), dtype=torch.float32, device="cpu"),
+        }
+        self._motion_planner_visualizers = {}
         if self.collect_data:
             # Initialize data buffers for each environment
             self.data_buffers = [
@@ -112,11 +139,21 @@ class ForgeEnv(IsaacForgeEnv):
                 for _ in range(self.num_envs)
             ]
             self.reset_data_buffer()
+            self.motion_planner = [MotionPolicy() for _ in range(self.num_envs)]
+            self.motion_planner_last_action = [None for _ in range(self.num_envs)]
+            self.motion_planner_active[:] = True
+        if self.debug_motion_planner and self.debug_motion_planner_visualize:
+            self._init_motion_planner_debug_vis()
         
         self.success_times = 0
         self.total_times = 0
+        self._init_experiment_logging()
         # episode_start flag for episode-streaming style policies (CPU-side, one bool per env)
         self._episode_start = torch.ones((self.num_envs,), dtype=torch.bool, device="cpu")
+        self.control_mode = str(getattr(self.cfg, "control_mode", "position")).lower()
+        if self.control_mode not in {"position", "torque"}:
+            raise ValueError(f"Unsupported control_mode: {self.control_mode}. Expected 'position' or 'torque'.")
+        
         
     def _setup_scene(self):
         super()._setup_scene()
@@ -128,6 +165,150 @@ class ForgeEnv(IsaacForgeEnv):
         if hasattr(self.cfg, "tiled_camera") and self.cfg.tiled_camera is not None:
             self.tiled_camera = TiledCamera(self.cfg.tiled_camera)
             self.scene.sensors["tiled_camera"] = self.tiled_camera
+
+    def _init_motion_planner_debug_vis(self):
+        marker_specs = {
+            "current_ee": "/Visuals/MotionPlanner/current_ee",
+            "target_ee": "/Visuals/MotionPlanner/target_ee",
+            "target_held": "/Visuals/MotionPlanner/target_held",
+            "fixed_frame": "/Visuals/MotionPlanner/fixed_frame",
+        }
+        for key, prim_path in marker_specs.items():
+            marker_cfg = FRAME_MARKER_CFG.replace(prim_path=prim_path)
+            marker_cfg.markers["frame"].scale = (0.08, 0.08, 0.08)
+            self._motion_planner_visualizers[key] = VisualizationMarkers(marker_cfg)
+
+    def _update_motion_planner_debug_vis(self):
+        if not self.debug_motion_planner or not self._motion_planner_visualizers:
+            return
+
+        valid_mask = self.motion_planner_debug["valid"]
+        if not torch.any(valid_mask):
+            return
+
+        valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(-1)
+        for key, visualizer in self._motion_planner_visualizers.items():
+            pose_key = {
+                "current_ee": "cur_ee_pose",
+                "target_ee": "target_ee_pose",
+                "target_held": "target_held_pose",
+                "fixed_frame": "fixed_pose",
+            }[key]
+            poses = self.motion_planner_debug[pose_key][valid_indices]
+            visualizer.visualize(translations=poses[:, :3], orientations=poses[:, 3:])
+
+    def _print_motion_planner_debug(self):
+        if not self.debug_motion_planner:
+            return
+        interval = max(1, self.debug_motion_planner_print_interval)
+        if self.common_step_counter > 20 and self.common_step_counter % interval != 0:
+            return
+
+        valid_mask = self.motion_planner_debug["valid"]
+        if not torch.any(valid_mask):
+            return
+
+        valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(-1)
+        current_pose = torch.cat(
+            [
+                self.fingertip_midpoint_pos[valid_indices].to("cpu"),
+                self.fingertip_midpoint_quat[valid_indices].to("cpu"),
+            ],
+            dim=1,
+        )
+        self.motion_planner_debug["cur_ee_pose"][valid_indices] = current_pose
+
+        env_idx = int(valid_mask.nonzero(as_tuple=False)[0].item())
+        cur_pose = self.motion_planner_debug["cur_ee_pose"][env_idx].tolist()
+        target_ee_pose = self.motion_planner_debug["target_ee_pose"][env_idx].tolist()
+        target_held_pose = self.motion_planner_debug["target_held_pose"][env_idx].tolist()
+        fixed_pose = self.motion_planner_debug["fixed_pose"][env_idx].tolist()
+        held_to_tcp_pose = self.motion_planner_debug["held_to_tcp_pose"][env_idx].tolist()
+        next_action = self.motion_planner_debug["next_action"][env_idx].tolist()
+        ctrl_target_pose = self.motion_planner_debug["ctrl_target_pose"][env_idx].tolist()
+        joint_pos = self.motion_planner_debug["joint_pos"][env_idx].tolist()
+        ctrl_target_joint_pos = self.motion_planner_debug["ctrl_target_joint_pos"][env_idx].tolist()
+        pos_err = (
+            self.motion_planner_debug["ctrl_target_pose"][env_idx, :3]
+            - self.motion_planner_debug["cur_ee_pose"][env_idx, :3]
+        ).tolist()
+        rot_err_deg = float(
+            torch.rad2deg(
+                self._quat_angle_error_wxyz(
+                    self.motion_planner_debug["cur_ee_pose"][env_idx, 3:].unsqueeze(0),
+                    self.motion_planner_debug["ctrl_target_pose"][env_idx, 3:].unsqueeze(0),
+                )
+            ).item()
+        )
+        print(
+            f"[MotionPlanner][env={env_idx}][step={int(self.common_step_counter)}]\n"
+            f"  current_ee  pos={cur_pose[:3]} quat={cur_pose[3:]}\n"
+            f"  target_ee   pos={target_ee_pose[:3]} quat={target_ee_pose[3:]}\n"
+            f"  target_held pos={target_held_pose[:3]} quat={target_held_pose[3:]}\n"
+            f"  fixed_frame pos={fixed_pose[:3]} quat={fixed_pose[3:]}\n"
+            f"  held_to_tcp pos={held_to_tcp_pose[:3]} quat={held_to_tcp_pose[3:]}\n"
+            f"  next_action pos={next_action[:3]} quat={next_action[3:7]} gripper={next_action[7]}\n"
+            f"  ctrl_target pos={ctrl_target_pose[:3]} quat={ctrl_target_pose[3:]}\n"
+            f"  ee_err      dpos={pos_err} rot_err_deg={rot_err_deg:.2f}\n"
+            f"  joint_pos   {joint_pos}\n"
+            f"  joint_tgt   {ctrl_target_joint_pos}"
+        )
+
+    @staticmethod
+    def _quat_angle_error_wxyz(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        q1 = torch.nn.functional.normalize(q1, dim=-1)
+        q2 = torch.nn.functional.normalize(q2, dim=-1)
+        dot = torch.sum(q1 * q2, dim=-1).abs().clamp(-1.0, 1.0)
+        return 2.0 * torch.acos(dot)
+
+    def _init_experiment_logging(self):
+        """Create logging artifacts for the current run."""
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        self.config_output_dir = os.path.join(self.output_dir, "config")
+        os.makedirs(self.config_output_dir, exist_ok=True)
+
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        config_files = ("forge_env_cfg.py", "forge_tasks_cfg.py")
+        for config_name in config_files:
+            src_path = os.path.join(current_dir, config_name)
+            dst_path = os.path.join(self.config_output_dir, config_name)
+            if os.path.exists(src_path):
+                shutil.copy2(src_path, dst_path)
+
+        self.success_log_path = os.path.join(self.output_dir, "success_rate.csv")
+        if not os.path.exists(self.success_log_path):
+            with open(self.success_log_path, "w", newline="") as csvfile:
+                csv_writer = csv.writer(csvfile)
+                csv_writer.writerow(
+                    [
+                        "common_step",
+                        "env_id",
+                        "episode_length",
+                        "success",
+                        "success_times",
+                        "total_times",
+                        "success_rate_percent",
+                    ]
+                )
+
+    def _log_success_rate(self, env_id: int, success: bool):
+        """Append episode-level success statistics to disk."""
+        success_rate = (self.success_times / self.total_times) * 100 if self.total_times > 0 else 0.0
+        with open(self.success_log_path, "a", newline="") as csvfile:
+            csv_writer = csv.writer(csvfile)
+            csv_writer.writerow(
+                [
+                    int(self.common_step_counter),
+                    int(env_id),
+                    int(self.episode_length_buf[env_id].item()),
+                    int(bool(success)),
+                    int(self.success_times),
+                    int(self.total_times),
+                    f"{success_rate:.6f}",
+                ]
+            )
+        return success_rate
         
     def record_data(self, env_idx=None):
         """
@@ -467,7 +648,7 @@ class ForgeEnv(IsaacForgeEnv):
                 )
                 self.success_times = self.success_times + 1 if success[env_ids] else self.success_times
                 self.total_times += 1
-                success_rate = (self.success_times / self.total_times) * 100 if self.total_times > 0 else 0.0
+                success_rate = self._log_success_rate(env_ids, bool(success[env_ids]))
                 if self.collect_data and self.reset_terminated[env_ids]:
                     if success[env_ids]:
                         print("Task success!")
@@ -515,6 +696,11 @@ class ForgeEnv(IsaacForgeEnv):
             for i in range(self.num_envs):
                 self.data_buffers[i]["actions"].append(self.next_action[i])
 
+        if self.debug_motion_planner:
+            if self.debug_motion_planner_visualize:
+                self._update_motion_planner_debug_vis()
+            self._print_motion_planner_debug()
+
         # update observations
         self.obs_buf = self._get_observations()
 
@@ -526,7 +712,7 @@ class ForgeEnv(IsaacForgeEnv):
         # return observations, rewards, resets and extras
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
     
-    def _apply_action(self):
+    def _apply_action_torque_control(self):
         """FORGE actions are defined as targets relative to the fixed asset."""
         if self.last_update_timestamp < self._robot._data._sim_timestamp:
             self._compute_intermediate_values(dt=self.physics_dt)
@@ -616,8 +802,77 @@ class ForgeEnv(IsaacForgeEnv):
                 # ctrl_target_fingertip_midpoint_quat= torch.tensor(
                 #     [[0.0, 1.0, 0.0, 0.0]], device=self.device
                 # ),
-                ctrl_target_gripper_dof_pos=0.0,
+                ctrl_target_gripper_dof_pos=self.next_action[:,-1:],
             )
+        elif self.motion_planner is not None and self.planner_to_rl_handoff:
+            gripper = torch.zeros((self.num_envs, 1), dtype=self.fingertip_midpoint_pos.dtype, device=self.device)
+            rl_next_action = torch.cat(
+                [
+                    ctrl_target_fingertip_midpoint_pos,
+                    ctrl_target_fingertip_midpoint_quat,
+                    gripper,
+                ],
+                dim=1,
+            )
+            next_action = rl_next_action.clone()
+            planner_target_pos = ctrl_target_fingertip_midpoint_pos.clone()
+            planner_target_quat = ctrl_target_fingertip_midpoint_quat.clone()
+            planner_target_gripper = gripper.clone()
+
+            for env_idx in range(self.num_envs):
+                if not self.motion_planner_active[env_idx]:
+                    continue
+
+                target_pose = self.motion_planner_target_ee[env_idx]
+                pos_err = torch.linalg.norm(self.fingertip_midpoint_pos[env_idx] - target_pose[:3])
+                rot_err = self._quat_angle_error_wxyz(
+                    self.fingertip_midpoint_quat[env_idx].unsqueeze(0),
+                    target_pose[3:].unsqueeze(0),
+                ).squeeze(0)
+
+                if self.planner_to_rl_handoff and pos_err <= self.planner_to_rl_pos_tol and rot_err <= self.planner_to_rl_rot_tol:
+                    self.motion_planner_active[env_idx] = False
+                    self.motion_planner_debug["valid"][env_idx] = False
+                    print(
+                        f"[MotionPlanner->RL][env={env_idx}][step={int(self.common_step_counter)}] "
+                        f"handoff pos_err={float(pos_err):.4f} rot_err_deg={float(torch.rad2deg(rot_err)):.2f}"
+                    )
+                    continue
+
+                planner_action = self.motion_planner[env_idx].get_action()
+                if planner_action is None:
+                    planner_action = self.motion_planner_last_action[env_idx]
+                else:
+                    self.motion_planner_last_action[env_idx] = planner_action
+
+                if planner_action is None:
+                    continue
+
+                planner_action = torch.tensor(
+                    planner_action, dtype=self.fingertip_midpoint_pos.dtype, device=self.device
+                )
+                next_action[env_idx] = planner_action
+                planner_target_pos[env_idx] = planner_action[:3]
+                planner_target_quat[env_idx] = planner_action[3:7]
+                planner_target_gripper[env_idx] = planner_action[-1]
+
+            self.next_action = next_action
+            if self.debug_motion_planner:
+                self.motion_planner_debug["next_action"] = self.next_action.detach().to("cpu", dtype=torch.float32)
+                self.motion_planner_debug["ctrl_target_pose"] = torch.cat(
+                    [planner_target_pos, planner_target_quat], dim=1
+                ).detach().to("cpu", dtype=torch.float32)
+            self.generate_ctrl_signals(
+                ctrl_target_fingertip_midpoint_pos=planner_target_pos,
+                ctrl_target_fingertip_midpoint_quat=planner_target_quat,
+                # ctrl_target_gripper_dof_pos=0.0,
+                ctrl_target_gripper_dof_pos=planner_target_gripper,
+            )
+            if self.debug_motion_planner:
+                self.motion_planner_debug["joint_pos"] = self.joint_pos[:, :7].detach().to("cpu", dtype=torch.float32)
+                self.motion_planner_debug["ctrl_target_joint_pos"] = (
+                    self.ctrl_target_joint_pos[:, :7].detach().to("cpu", dtype=torch.float32)
+                )
         else:
             ctrl_target_gripper_dof_pos = 0.0
             gripper = torch.tensor(ctrl_target_gripper_dof_pos, device="cuda")
@@ -639,6 +894,197 @@ class ForgeEnv(IsaacForgeEnv):
                 ctrl_target_gripper_dof_pos=0.0,
             )
         # ===========================================================
+        
+    def _apply_action_position_control(self):
+        """Position-control variant of _apply_action using DLS IK to produce joint targets."""
+        if self.last_update_timestamp < self._robot._data._sim_timestamp:
+            self._compute_intermediate_values(dt=self.physics_dt)
+        joint_dtype = self.joint_pos.dtype
+
+        # Step (0): Scale actions to allowed range.
+        pos_actions = self.actions[:, 0:3]
+        pos_actions = pos_actions @ torch.diag(torch.tensor(self.cfg.ctrl.pos_action_bounds, device=self.device))
+
+        rot_actions = self.actions[:, 3:6]
+        rot_actions = rot_actions @ torch.diag(torch.tensor(self.cfg.ctrl.rot_action_bounds, device=self.device))
+
+        # Step (1): Compute desired pose targets in EE frame.
+        fixed_pos_action_frame = self.fixed_pos_obs_frame + self.init_fixed_pos_obs_noise
+        ctrl_target_fingertip_preclipped_pos = fixed_pos_action_frame + pos_actions
+
+        if self.cfg.disable_xy_rot:
+            rot_actions[:, 0:2] = 0.0
+
+        rot_actions[:, 2] = (
+            torch.tensor(np.deg2rad(-180.0), device=self.device, dtype=joint_dtype)
+            + torch.tensor(np.deg2rad(270.0), device=self.device, dtype=joint_dtype) * (rot_actions[:, 2] + 1.0) / 2.0
+        )
+        bolt_frame_quat = torch_utils.quat_from_euler_xyz(
+            roll=rot_actions[:, 0], pitch=rot_actions[:, 1], yaw=rot_actions[:, 2]
+        )
+
+        rot_180_euler = torch.tensor([np.pi, 0.0, 0.0], device=self.device).repeat(self.num_envs, 1)
+        quat_bolt_to_ee = torch_utils.quat_from_euler_xyz(
+            roll=rot_180_euler[:, 0], pitch=rot_180_euler[:, 1], yaw=rot_180_euler[:, 2]
+        )
+        ctrl_target_fingertip_preclipped_quat = torch_utils.quat_mul(quat_bolt_to_ee, bolt_frame_quat)
+
+        # Step (2): Clip targets if they are too far from current EE pose.
+        self.delta_pos = ctrl_target_fingertip_preclipped_pos - self.fingertip_midpoint_pos
+        pos_error_clipped = torch.clip(self.delta_pos, -self.pos_threshold, self.pos_threshold)
+        ctrl_target_fingertip_midpoint_pos = self.fingertip_midpoint_pos + pos_error_clipped
+
+        curr_roll, curr_pitch, curr_yaw = torch_utils.get_euler_xyz(self.fingertip_midpoint_quat)
+        desired_roll, desired_pitch, desired_yaw = torch_utils.get_euler_xyz(ctrl_target_fingertip_preclipped_quat)
+        desired_xyz = torch.stack([desired_roll, desired_pitch, desired_yaw], dim=1)
+
+        curr_yaw = factory_utils.wrap_yaw(curr_yaw)
+        desired_yaw = factory_utils.wrap_yaw(desired_yaw)
+        self.delta_yaw = desired_yaw - curr_yaw
+        clipped_yaw = torch.clip(self.delta_yaw, -self.rot_threshold[:, 2], self.rot_threshold[:, 2])
+        desired_xyz[:, 2] = curr_yaw + clipped_yaw
+
+        desired_roll = torch.where(desired_roll < 0.0, desired_roll + 2 * torch.pi, desired_roll)
+        desired_pitch = torch.where(desired_pitch < 0.0, desired_pitch + 2 * torch.pi, desired_pitch)
+
+        delta_roll = desired_roll - curr_roll
+        clipped_roll = torch.clip(delta_roll, -self.rot_threshold[:, 0], self.rot_threshold[:, 0])
+        desired_xyz[:, 0] = curr_roll + clipped_roll
+
+        curr_pitch = torch.where(curr_pitch > torch.pi, curr_pitch - 2 * torch.pi, curr_pitch)
+        desired_pitch = torch.where(desired_pitch > torch.pi, desired_pitch - 2 * torch.pi, desired_pitch)
+        delta_pitch = desired_pitch - curr_pitch
+        clipped_pitch = torch.clip(delta_pitch, -self.rot_threshold[:, 1], self.rot_threshold[:, 1])
+        desired_xyz[:, 1] = curr_pitch + clipped_pitch
+
+        ctrl_target_fingertip_midpoint_quat = torch_utils.quat_from_euler_xyz(
+            roll=desired_xyz[:, 0], pitch=desired_xyz[:, 1], yaw=desired_xyz[:, 2]
+        )
+
+        if hasattr(self, "policy") and self.policy is not None:
+            target_pos = self.next_action[:, :3].to(dtype=joint_dtype)
+            target_quat = self.next_action[:, 3:7].to(dtype=joint_dtype)
+            target_gripper = self.next_action[:, -1:].to(dtype=joint_dtype)
+        elif self.motion_planner is not None and self.planner_to_rl_handoff:
+            gripper = torch.zeros((self.num_envs, 1), dtype=self.fingertip_midpoint_pos.dtype, device=self.device)
+            rl_next_action = torch.cat(
+                [ctrl_target_fingertip_midpoint_pos, ctrl_target_fingertip_midpoint_quat, gripper], dim=1
+            )
+            next_action = rl_next_action.clone()
+            target_pos = ctrl_target_fingertip_midpoint_pos.clone()
+            target_quat = ctrl_target_fingertip_midpoint_quat.clone()
+            target_gripper = gripper.clone()
+
+            for env_idx in range(self.num_envs):
+                if not self.motion_planner_active[env_idx]:
+                    continue
+
+                target_pose = self.motion_planner_target_ee[env_idx]
+                pos_err = torch.linalg.norm(self.fingertip_midpoint_pos[env_idx] - target_pose[:3])
+                rot_err = self._quat_angle_error_wxyz(
+                    self.fingertip_midpoint_quat[env_idx].unsqueeze(0),
+                    target_pose[3:].unsqueeze(0),
+                ).squeeze(0)
+
+                if self.planner_to_rl_handoff and pos_err <= self.planner_to_rl_pos_tol and rot_err <= self.planner_to_rl_rot_tol:
+                    self.motion_planner_active[env_idx] = False
+                    self.motion_planner_debug["valid"][env_idx] = False
+                    print(
+                        f"[MotionPlanner->RL][env={env_idx}][step={int(self.common_step_counter)}] "
+                        f"handoff pos_err={float(pos_err):.4f} rot_err_deg={float(torch.rad2deg(rot_err)):.2f}"
+                    )
+                    continue
+
+                planner_action = self.motion_planner[env_idx].get_action()
+                if planner_action is None:
+                    planner_action = self.motion_planner_last_action[env_idx]
+                else:
+                    self.motion_planner_last_action[env_idx] = planner_action
+
+                if planner_action is None:
+                    continue
+
+                planner_action = torch.tensor(planner_action, dtype=joint_dtype, device=self.device)
+                next_action[env_idx] = planner_action
+                target_pos[env_idx] = planner_action[:3]
+                target_quat[env_idx] = planner_action[3:7]
+                target_gripper[env_idx] = planner_action[-1]
+
+            self.next_action = next_action
+            if self.debug_motion_planner:
+                self.motion_planner_debug["next_action"] = self.next_action.detach().to("cpu", dtype=torch.float32)
+                self.motion_planner_debug["ctrl_target_pose"] = torch.cat(
+                    [target_pos, target_quat], dim=1
+                ).detach().to("cpu", dtype=torch.float32)
+        else:
+            ctrl_target_gripper_dof_pos = 0.0
+            gripper = torch.full(
+                (self.fingertip_midpoint_pos.shape[0], 1),
+                ctrl_target_gripper_dof_pos,
+                dtype=self.fingertip_midpoint_pos.dtype,
+                device=self.device,
+            )
+            self.next_action = torch.cat(
+                [ctrl_target_fingertip_midpoint_pos, ctrl_target_fingertip_midpoint_quat, gripper], dim=1
+            )
+            target_pos = ctrl_target_fingertip_midpoint_pos.to(dtype=joint_dtype)
+            target_quat = ctrl_target_fingertip_midpoint_quat.to(dtype=joint_dtype)
+            target_gripper = gripper.to(dtype=joint_dtype)
+
+        pos_error, axis_angle_error = factory_control.get_pose_error(
+            fingertip_midpoint_pos=self.fingertip_midpoint_pos.to(dtype=joint_dtype),
+            fingertip_midpoint_quat=self.fingertip_midpoint_quat.to(dtype=joint_dtype),
+            ctrl_target_fingertip_midpoint_pos=target_pos,
+            ctrl_target_fingertip_midpoint_quat=target_quat,
+            jacobian_type="geometric",
+            rot_error_type="axis_angle",
+        )
+        delta_hand_pose = torch.cat((pos_error, axis_angle_error), dim=-1).to(dtype=joint_dtype)
+        delta_dof_pos = factory_control.get_delta_dof_pos(
+            delta_pose=delta_hand_pose,
+            ik_method="dls",
+            jacobian=self.fingertip_midpoint_jacobian.to(dtype=joint_dtype),
+            device=self.device,
+        )
+
+        joint_target = self.joint_pos.clone()
+        joint_target[:, 0:7] = joint_target[:, 0:7] + delta_dof_pos[:, 0:7]
+        joint_target[:, 7:9] = target_gripper
+
+        self.ctrl_target_joint_pos[:, :] = joint_target
+        self._robot.set_joint_position_target(self.ctrl_target_joint_pos)
+
+        if self.debug_motion_planner:
+            self.motion_planner_debug["joint_pos"] = self.joint_pos[:, :7].detach().to("cpu", dtype=torch.float32)
+            self.motion_planner_debug["ctrl_target_joint_pos"] = (
+                self.ctrl_target_joint_pos[:, :7].detach().to("cpu", dtype=torch.float32)
+            )
+
+    def _apply_action(self):
+        """Dispatch to the configured arm control mode."""
+        desired_mode = "position" if self.motion_planner_active[0] else "torque" # motion plan 的时候用位置控制，切换为 rl policy 的时候用扭矩控制
+        if self.motion_planner is not None and self.planner_to_rl_handoff and self.control_mode != desired_mode:
+            self.control_mode = desired_mode
+            self.cfg.control_mode = desired_mode
+
+            arm_joint_ids = self._robot.find_joints("panda_joint[1-7]")[0]
+            arm_stiffness = 800.0 if desired_mode == "position" else 0.0
+            arm_damping = 40.0 if desired_mode == "position" else 0.0
+
+            self._robot.write_joint_stiffness_to_sim(arm_stiffness, joint_ids=arm_joint_ids)
+            self._robot.write_joint_damping_to_sim(arm_damping, joint_ids=arm_joint_ids)
+
+            for actuator_name in ("panda_arm1", "panda_arm2"):
+                actuator = self._robot.actuators.get(actuator_name)
+                if actuator is not None:
+                    actuator.stiffness[:] = arm_stiffness
+                    actuator.damping[:] = arm_damping
+
+        if self.control_mode == "torque":
+            self._apply_action_torque_control()
+        else:
+            self._apply_action_position_control()
+                
         
             
     def select_action(self, policy):
@@ -702,14 +1148,188 @@ class ForgeEnv(IsaacForgeEnv):
         
         return action_list
     
+    def _build_motion_planner(self,env_ids):
+        # 构建 MotionPlanner
+        if self.motion_planner is not None:
+            for env_idx in env_ids.tolist():
+                cur_ee_pose = torch.cat([
+                    self.fingertip_midpoint_pos[env_idx], 
+                    self.fingertip_midpoint_quat[env_idx]
+                ], dim=0).to("cpu")
+                
+                if self.cfg.task_name == "peg_insert":
+                    held_asset_relative_pos, held_asset_relative_quat = self.get_handheld_asset_relative_pose() # 实际上获取的位置是不对的，因为这个函数里面只考虑了peg没有旋转的情形，但我们的peg有30度的旋转，但是不影响
+
+                    target_held_pos = self.fixed_pos_obs_frame[env_idx].unsqueeze(0).clone()
+                    target_held_pos[:, 2] += 0.03
+                    target_held_quat = self.fixed_quat[env_idx].unsqueeze(0)
+                    
+                    rot_180_euler = torch.tensor([[np.pi, 0.0, 0.0]], device=self.device)
+                    quat_bolt_to_ee = torch_utils.quat_from_euler_xyz(
+                        roll=rot_180_euler[:, 0],
+                        pitch=rot_180_euler[:, 1],
+                        yaw=rot_180_euler[:, 2],
+                    )
+
+                    held_to_tcp_quat = quat_bolt_to_ee
+                    held_to_tcp_pos = held_asset_relative_pos[env_idx].unsqueeze(0)
+                    
+                    target_ee_quat, target_ee_pos = torch_utils.tf_combine(
+                        target_held_quat,
+                        target_held_pos,
+                        held_to_tcp_quat,
+                        held_to_tcp_pos,
+                    )
+                    # Debug experiment: keep the current EE orientation and only test
+                    # whether the controller can track the planned position target.
+                    target_ee_quat = cur_ee_pose[3:].unsqueeze(0).to(self.device)
+                    target_ee_pose = torch.cat([target_ee_pos.squeeze(0), target_ee_quat.squeeze(0)], dim=0).to("cpu")
+                    target_held_pose = torch.cat([target_held_pos.squeeze(0), target_held_quat.squeeze(0)], dim=0).to("cpu")
+                    held_to_tcp_pose = torch.cat([held_to_tcp_pos.squeeze(0), held_to_tcp_quat.squeeze(0)], dim=0).to("cpu")
+                    fixed_pose = torch.cat([
+                        self.fixed_pos_obs_frame[env_idx].to("cpu"),
+                        self.fixed_quat[env_idx].to("cpu"),
+                    ], dim=0)
+                    
+                    pose_planner = PoseTrajectoryPlanner()
+                    move_action = pose_planner.plan( 
+                        cur_pose = cur_ee_pose,
+                        target_pose = target_ee_pose,
+                        num_steps = 100, # 50 步后到达目标点
+                        gripper = 0.0,
+                    )
+                    self.motion_planner[env_idx]._append_segment(move_action)
+                    self.motion_planner_active[env_idx] = True
+                    self.motion_planner_target_ee[env_idx] = torch.cat(
+                        [target_ee_pos.squeeze(0), target_ee_quat.squeeze(0)], dim=0
+                    )
+                    if self.debug_motion_planner:
+                        self.motion_planner_debug["valid"][env_idx] = True
+                        self.motion_planner_debug["cur_ee_pose"][env_idx] = cur_ee_pose
+                        self.motion_planner_debug["target_ee_pose"][env_idx] = target_ee_pose
+                        self.motion_planner_debug["target_held_pose"][env_idx] = target_held_pose
+                        self.motion_planner_debug["fixed_pose"][env_idx] = fixed_pose
+                        self.motion_planner_debug["held_to_tcp_pose"][env_idx] = held_to_tcp_pose
+                elif self.cfg.task_name == "gear_assembly":
+                    held_base_pos, held_base_quat = factory_utils.get_held_base_pose(
+                        self.held_pos, self.held_quat, "gear_mesh", self.cfg_task.fixed_asset_cfg, self.num_envs, self.device
+                    )
+                     
+                    target_ee_pos = held_base_pos[env_idx][0:3].unsqueeze(0).clone()
+                    target_ee_pos[:, 2] += 0.017
+                    # target_ee_quat = self.fixed_quat[env_idx].unsqueeze(0)
+                    target_ee_quat = self.fingertip_midpoint_quat
+                    
+                    # Debug experiment: keep the current EE orientation and only test
+                    # whether the controller can track the planned position target.
+                    target_ee_pose = torch.cat([target_ee_pos.squeeze(0), target_ee_quat.squeeze(0)], dim=0).to("cpu")
+                    waypoint_1 = target_ee_pose.clone()
+                    waypoint_1[2] += 0.06
+                    pose_planner = PoseTrajectoryPlanner()
+                    move_action = pose_planner.plan(  # 移到gear的上方
+                        cur_pose = cur_ee_pose,
+                        target_pose = waypoint_1,
+                        num_steps = 150, # 50 步后到达目标点
+                        gripper = 0.03,
+                    )
+                    self.motion_planner[env_idx]._append_segment(move_action)
+                    move_action = pose_planner.plan(  # 下降
+                        cur_pose = waypoint_1,
+                        target_pose = target_ee_pose,
+                        num_steps = 100, # 50 步后到达目标点
+                        gripper = 0.03,
+                    )
+                    
+                    self.motion_planner[env_idx]._append_segment(move_action)
+                    
+                    
+                    self.motion_planner[env_idx]._append_segment(
+                        pose_planner.plan(  # 稳定
+                        cur_pose = target_ee_pose,
+                        target_pose = target_ee_pose,
+                        num_steps = 30, # 50 步后到达目标点
+                        gripper = 0.03,
+                        )
+                    )
+                    
+                    move_action = pose_planner.plan(  # 闭合gripper
+                        cur_pose = target_ee_pose,
+                        target_pose = target_ee_pose,
+                        num_steps = 200, # 50 步后到达目标点
+                        gripper = 0.0,
+                    )
+                    self.motion_planner[env_idx]._append_segment(move_action)
+                    
+                    waypoint_2 = target_ee_pose.clone() 
+                    waypoint_2[2] = waypoint_2[2] + 0.06 
+                    self.motion_planner[env_idx]._append_segment(
+                        pose_planner.plan(  # 下降
+                            cur_pose = target_ee_pose,
+                            target_pose = waypoint_2,
+                            num_steps = 150, # 50 步后到达目标点
+                            gripper = 0.0,
+                        )
+                    )
+                    
+                    target_gear_pos, target_gear_quat =  factory_utils.get_target_held_base_pose(
+                        self.fixed_pos,
+                        self.fixed_quat,
+                        "gear_mesh",
+                        self.cfg_task.fixed_asset_cfg,
+                        self.num_envs,
+                        self.device,
+                    )
+                    target_gear_pose =  torch.cat([target_gear_pos.squeeze(0),  self.fingertip_midpoint_quat.squeeze(0)], dim=0).to("cpu")
+                    target_gear_pose[2] = waypoint_2[2]
+                    self.motion_planner[env_idx]._append_segment(
+                        pose_planner.plan(  # 下降
+                            cur_pose = waypoint_2,
+                            target_pose = target_gear_pose,
+                            num_steps = 150, # 50 步后到达目标点
+                            gripper = 0.0,
+                        )
+                    )
+                     
+                    waypoint_4 = target_gear_pose.clone()
+                    waypoint_4[2] = target_gear_pose[2] - 0.04
+                    self.motion_planner[env_idx]._append_segment(
+                        pose_planner.plan(  # 下降
+                            cur_pose = target_gear_pose,
+                            target_pose = waypoint_4,
+                            num_steps = 150, # 50 步后到达目标点
+                            gripper = 0.0,
+                        )
+                    )
+                    self.motion_planner_active[env_idx] = True
+                    self.motion_planner_target_ee[env_idx] = waypoint_4
+                    
+                    
+
     def _reset_idx(self, env_ids):
         """Perform additional randomizations."""
         super()._reset_idx(env_ids)
+        # print("fingertip_midpoint_pos:",self.fingertip_midpoint_pos)
+        # print("fingertip_midpoint_quat:",self.fingertip_midpoint_quat)
+        # print("fixed_pos:",self.fixed_pos)
+        # print("fixed_quat:",self.fixed_quat)
         
         # ========== 新增: 重置policy状态 ==========
         if hasattr(self, 'policy') and self.policy is not None:
             self.policy.reset()
-    
+            
+        if self.motion_planner is not None and self.planner_to_rl_handoff:
+            self.motion_planner = [MotionPolicy() for _ in range(self.num_envs)]
+            self.motion_planner_last_action = [None for _ in range(self.num_envs)]
+            self.motion_planner_active[env_ids] = True
+            self.motion_planner_debug["valid"][env_ids.to(device="cpu")] = False
+            self._build_motion_planner(env_ids)
+        # =========================================
+        # mark episode start for reset envs (CPU-side flag consumed in select_action)
+        if env_ids is not None and len(env_ids) > 0:
+            self._episode_start[env_ids.to(device="cpu")] = True
+        
+        
+        
     def randomize_initial_state(self, env_ids):
         """Randomize initial state and perform any episode-level randomization."""
         # Disable gravity.
@@ -871,7 +1491,8 @@ class ForgeEnv(IsaacForgeEnv):
 
         # Add asset in hand randomization
         # [MODIFIED] 使用局部生成器 self.rng
-
+        # 注意：原文这里是对 self.num_envs 进行随机，建议保持原逻辑以防维度不匹配
+        # 如果只想对 env_ids 随机，需要修改这部分逻辑，但为了稳妥起见，我们只替换生成器
         rand_sample = torch.rand((self.num_envs, 3), generator=self.rng, dtype=torch.float32, device=self.device)
         
         held_asset_pos_noise = 2 * (rand_sample - 0.5)  # [-1, 1]
@@ -924,7 +1545,36 @@ class ForgeEnv(IsaacForgeEnv):
                 t2=held_asset_pos_noise,
             )
             
-
+        if self.cfg.task_name == "gear_assembly": # 对于这个任务，需要将gear在桌面上随机放置
+            held_base_pos_local = factory_utils.get_held_base_pos_local( "gear_mesh", self.cfg_task.fixed_asset_cfg, self.num_envs, self.device) # gear 的中心点相对于其基坐标系的偏移
+            held_base_quat_local = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
+            
+            held_inverse_quat_local , held_inverse_pos_local  = torch_utils.tf_inverse(
+                held_base_quat_local, held_base_pos_local
+            )
+            
+            dist_rand = 2 * torch.rand((len(env_ids)), generator=self.rng, dtype=torch.float32, device=self.device) -1 # 随机距离
+            theta_rand = 2 * torch.rand((len(env_ids)), generator=self.rng, dtype=torch.float32, device=self.device) -1 # 随机角度
+            
+            dist = self.cfg.gear_init_min_distance + dist_rand * (self.cfg.gear_init_max_distance - self.cfg.gear_init_min_distance)
+            theta = theta_rand * np.pi
+            
+            target_gear_pos = fixed_state[:,0:3].clone()
+            target_gear_pos[:,0] += dist * torch.cos(theta)
+            target_gear_pos[:,1] += dist * torch.sin(theta)
+            target_gear_quat = fixed_state[:,3:7]
+            
+            translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
+                target_gear_quat,
+                target_gear_pos,
+                held_inverse_quat_local,
+                held_inverse_pos_local,
+            )
+            
+            # 设置重力
+            # physics_sim_view.set_gravity(carb.Float3(9.8, 0.0, 0.0))
+            
+            
         held_state = self._held_asset.data.default_root_state.clone()
         held_state[:, 0:3] = translated_held_asset_pos + self.scene.env_origins
         held_state[:, 3:7] = translated_held_asset_quat
@@ -945,12 +1595,13 @@ class ForgeEnv(IsaacForgeEnv):
 
         self.step_sim_no_action()
 
-        grasp_time = 0.0
-        while grasp_time < 0.25:
-            self.ctrl_target_joint_pos[env_ids, 7:] = 0.0  # Close gripper.
-            self.close_gripper_in_place()
-            self.step_sim_no_action()
-            grasp_time += self.sim.get_physics_dt()
+        if self.cfg.task_name != "gear_assembly": # gear assembly 需要先夹起 gear 然后装配，因此不需要闭合夹爪
+            grasp_time = 0.0
+            while grasp_time < 0.25:
+                self.ctrl_target_joint_pos[env_ids, 7:] = 0.0  # Close gripper.
+                self.close_gripper_in_place()
+                self.step_sim_no_action()
+                grasp_time += self.sim.get_physics_dt()
 
         self.prev_joint_pos = self.joint_pos[:, 0:7].clone()
         self.prev_fingertip_pos = self.fingertip_midpoint_pos.clone()

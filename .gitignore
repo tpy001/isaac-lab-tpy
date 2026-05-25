@@ -4,3 +4,16 @@ outputs/
 scripts/benchmarking/
 scripts/demos/
 __pycache__/
+assets/
+test*/
+textures/
+USB/
+USB_Base/
+
+# unused folders
+results/
+${data}/
+gear_baseline/
+gear_vae/
+peg_fullft/
+forge_all/

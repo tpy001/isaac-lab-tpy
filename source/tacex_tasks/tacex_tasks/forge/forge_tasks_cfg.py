@@ -151,7 +151,7 @@ class PegInsert(FactoryTask):
 
     # Robot
     # hand_init_pos: list = [0.0, 0.0, 0.047]  # Relative to fixed asset tip.
-    hand_init_pos: list = [0.0, 0.0, 0.08]  # Relative to fixed asset tip.
+    hand_init_pos: list = [0.0, 0.0, 0.06]  # Relative to fixed asset tip.
     # hand_init_pos_noise: list = [0.02, 0.02, 0.01]
     hand_init_pos_noise: list = [0.04, 0.04, 0.02]
     hand_init_orn: list = [3.1416, 0.0, 0.0]
@@ -238,3 +238,6 @@ class ForgeGearMesh(GearMesh, ForgeTask):
 @configclass
 class ForgeNutThread(NutThread, ForgeTask):
     contact_penalty_scale: float = 0.05
+    
+    hand_init_pos_noise: list = [0.04, 0.04, 0.02]
+    

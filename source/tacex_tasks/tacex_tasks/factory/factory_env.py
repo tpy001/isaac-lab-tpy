@@ -46,8 +46,18 @@ class FactoryEnv(DirectRLEnv):
 
 
         if cfg.policy_cfg:
-            # self.policy = PI0RemotePolicyTAVLA(cfg.policy_cfg)  # 如果是带力触觉的 TA-VLA 模型
-            self.policy = PI0RemotePolicy(cfg.policy_cfg) 
+            # 根据配置类型选择对应的远程策略：
+            # - PI0RemoteConfig -> PI0RemotePolicy（无历史 effort）
+            # - PI0RemoteTAVLAConfig -> PI0RemotePolicyTAVLA（带历史 effort）
+            from .policy.configuration_pi0remote import PI0RemoteConfig as _CfgBase, PI0RemoteTAVLAConfig as _CfgTavla
+            from .policy.modeling_pi0remote import PI0RemotePolicy, PI0RemotePolicyTAVLA
+            if isinstance(cfg.policy_cfg, _CfgTavla):
+                self.policy = PI0RemotePolicyTAVLA(cfg.policy_cfg)
+            elif isinstance(cfg.policy_cfg, _CfgBase):
+                self.policy = PI0RemotePolicy(cfg.policy_cfg)
+            else:
+                # 兜底：未知配置类型时，仍按基础 PI0RemotePolicy 处理
+                self.policy = PI0RemotePolicy(cfg.policy_cfg)
         else:
             self.policy = None
         self.next_action = []
@@ -77,6 +87,8 @@ class FactoryEnv(DirectRLEnv):
         self.output_dir = output_dir
         self.success_times = 0
         self.total_times = 0
+        # episode_start flag for episode-streaming style policies (CPU-side, one bool per env)
+        self._episode_start = torch.ones((self.num_envs,), dtype=torch.bool, device="cpu")
 
     def _set_default_dynamics_parameters(self):
         """Set parameters defining dynamic interactions."""
@@ -213,6 +225,11 @@ class FactoryEnv(DirectRLEnv):
 
         prev_actions = self.actions.clone()
 
+        force_list = []
+        for env_id in range(self.num_envs):
+            force_list.append(self.get_force("panda_hand",env_id))
+            
+        force = torch.stack(force_list)
         obs_dict = {
             "fingertip_pos": self.fingertip_midpoint_pos,
             "fingertip_pos_rel_fixed": self.fingertip_midpoint_pos - noisy_fixed_pos,
@@ -220,6 +237,7 @@ class FactoryEnv(DirectRLEnv):
             "ee_linvel": self.ee_linvel_fd,
             "ee_angvel": self.ee_angvel_fd,
             "prev_actions": prev_actions,
+            # "force": force,
         }
 
         state_dict = {
@@ -238,6 +256,7 @@ class FactoryEnv(DirectRLEnv):
             "pos_threshold": self.pos_threshold,
             "rot_threshold": self.rot_threshold,
             "prev_actions": prev_actions,
+            # "force": force,
         }
         return obs_dict, state_dict
 
@@ -260,14 +279,22 @@ class FactoryEnv(DirectRLEnv):
             batch_input = {
                 "observation.images.front": head_img_tensor,
                 "observation.images.left_wrist": wrist_img_tensor,
+                # Backward/remote-server compatible aliases:
+                "observation.images.head_camera": head_img_tensor,
+                "observation.images.wrist_left_camera": wrist_img_tensor,
                 "observation.state": _state,
                 "observation.effort": effort,
                 "task": prompt_data,
+                # For episode streaming: True only on the first step after reset (per env).
+                "episode_start": torch.tensor([bool(self._episode_start[env_idx].item())], dtype=torch.bool),
             }
 
             # 3. 调用 select_action
             next_action = policy.select_action(batch_input)
             action_list.append(next_action)
+            # consume episode_start after first use
+            if self._episode_start[env_idx]:
+                self._episode_start[env_idx] = False
                     
         return action_list
         
@@ -463,6 +490,9 @@ class FactoryEnv(DirectRLEnv):
         held_base_pos, held_base_quat = factory_utils.get_held_base_pose(
             self.held_pos, self.held_quat, self.cfg_task.name, self.cfg_task.fixed_asset_cfg, self.num_envs, self.device
         )
+        # print("Held base pos: ",held_base_pos)
+        # print("held_base_quat: ",held_base_quat)
+        
         target_held_base_pos, target_held_base_quat = factory_utils.get_target_held_base_pose(
             self.fixed_pos,
             self.fixed_quat,
@@ -471,6 +501,10 @@ class FactoryEnv(DirectRLEnv):
             self.num_envs,
             self.device,
         )
+        # print("target_held_base_pos: ", target_held_base_pos)
+        # print("target_held_base_quat: ",target_held_base_quat)
+        
+        
 
         xy_dist = torch.linalg.vector_norm(target_held_base_pos[:, 0:2] - held_base_pos[:, 0:2], dim=1)
         z_disp = held_base_pos[:, 2] - target_held_base_pos[:, 2]
@@ -556,7 +590,37 @@ class FactoryEnv(DirectRLEnv):
             self.num_envs,
             self.device,
         )
+        
+        if self.cfg_task.name == "peg_insert":
+            # --- 新增代码开始: 计算 XY 角度对齐奖励 ---
+            
+            # 1. 将四元数转换为欧拉角 (Roll, Pitch, Yaw)
+            # 注意：这里分别传入 held 和 target 的四元数
+            curr_roll, curr_pitch, _ = torch_utils.get_euler_xyz(held_base_quat)
+            target_roll, target_pitch, _ = torch_utils.get_euler_xyz(target_held_base_quat)
 
+            # 2. 计算差值
+            roll_diff = curr_roll - target_roll
+            pitch_diff = curr_pitch - target_pitch
+
+            # 3. 角度归一化 (Wrap to [-pi, pi])
+            # 这是为了处理周期性，例如 -179度和 +179度 实际上只差2度
+            roll_diff = torch.remainder(roll_diff + torch.pi, 2 * torch.pi) - torch.pi
+            pitch_diff = torch.remainder(pitch_diff + torch.pi, 2 * torch.pi) - torch.pi
+
+            # 4. 计算 XY 平面的总角度误差 (欧氏距离)
+            xy_angle_error = torch.sqrt(roll_diff**2 + pitch_diff**2)
+
+            # 5. 计算奖励 (使用高斯核或者是倒数形式)
+            # scale=2.0 意味着如果误差是 0.5弧度(~28度)，奖励衰减为 exp(-1) ≈ 0.36
+            # 你可以根据需要调整这个 2.0，越大对精度要求越高
+            rot_xy_reward = torch.exp(-2.0 * xy_angle_error)
+            
+            # print("roll,pitch:",curr_roll,curr_pitch)
+            # print("target_roll,target_pitch:",target_roll,target_pitch)
+            
+            # --- 新增代码结束 ---
+        
         keypoints_held = torch.zeros((self.num_envs, self.cfg_task.num_keypoints, 3), device=self.device)
         keypoints_fixed = torch.zeros((self.num_envs, self.cfg_task.num_keypoints, 3), device=self.device)
         offsets = factory_utils.get_keypoint_offsets(self.cfg_task.num_keypoints, self.device)
@@ -592,6 +656,7 @@ class FactoryEnv(DirectRLEnv):
             "action_grad_penalty": action_grad_penalty,
             "curr_engaged": curr_engaged.float(),
             "curr_success": curr_successes.float(),
+            # "rot_xy_reward":rot_xy_reward.float(),
         }
         rew_scales = {
             "kp_baseline": 1.0,
@@ -601,6 +666,7 @@ class FactoryEnv(DirectRLEnv):
             "action_grad_penalty": -self.cfg_task.action_grad_penalty_scale,
             "curr_engaged": 1.0,
             "curr_success": 1.0,
+            # "rot_xy_reward":1.0,
         }
         return rew_dict, rew_scales
 
@@ -858,6 +924,12 @@ class FactoryEnv(DirectRLEnv):
         if self.cfg.action_noise_model:
             action = self._action_noise_model(action)
 
+        # ========== 新增: 使用policy时将RL action置零 ==========
+        if hasattr(self, 'policy') and self.policy is not None:
+            action = torch.zeros_like(action)
+        # ====================================================
+    
+    
         # process actions
         self._pre_physics_step(action)
 
@@ -964,6 +1036,9 @@ class FactoryEnv(DirectRLEnv):
 
         if self.policy:
             self.policy.reset()
+        # mark episode start for reset envs (CPU-side flag consumed in select_action)
+        if env_ids is not None and len(env_ids) > 0:
+            self._episode_start[env_ids.to(device="cpu")] = True
 
     def _set_assets_to_default_pose(self, env_ids):
         """Move assets to default pose before randomization."""
@@ -1022,7 +1097,9 @@ class FactoryEnv(DirectRLEnv):
 
     def get_handheld_asset_relative_pose(self):
         """Get default relative pose between help asset and fingertip."""
+   
         if self.cfg_task.name == "peg_insert":
+            # 在 peg-in-hole任务中，peg的坐标系应该是底座的原点，假设peg的长度为 X, 而夹爪上指垫的长度为L，因此实际的抓取位置是 X - L
             held_asset_relative_pos = torch.zeros((self.num_envs, 3), device=self.device)
             held_asset_relative_pos[:, 2] = self.cfg_task.held_asset_cfg.height
             held_asset_relative_pos[:, 2] -= self.cfg_task.robot_cfg.franka_fingerpad_length
@@ -1042,6 +1119,7 @@ class FactoryEnv(DirectRLEnv):
         held_asset_relative_quat = (
             torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
         )
+        
         if self.cfg_task.name == "nut_thread":
             # Rotate along z-axis of frame for default position.
             initial_rot_deg = self.cfg_task.held_asset_rot_init
@@ -1084,11 +1162,16 @@ class FactoryEnv(DirectRLEnv):
     def randomize_initial_state(self, env_ids):
         """Randomize initial state and perform any episode-level randomization."""
         # Disable gravity.
+        # print("scene.env_origins",self.scene.env_origins)
+        # print("Env pos",self.scene.env_origins[env_ids])
         physics_sim_view = sim_utils.SimulationContext.instance().physics_sim_view
         physics_sim_view.set_gravity(carb.Float3(0.0, 0.0, 0.0))
 
         # (1.) Randomize fixed asset pose.
+        # Fixed state 是固定资产在世界坐标系下的坐标
         fixed_state = self._fixed_asset.data.default_root_state.clone()[env_ids]
+        # print("fixed_state",fixed_state)
+        
         # (1.a.) Position
         rand_sample = torch.rand((len(env_ids), 3), dtype=torch.float32, device=self.device)
         fixed_pos_init_rand = 2 * (rand_sample - 0.5)  # [-1, 1]
@@ -1114,6 +1197,7 @@ class FactoryEnv(DirectRLEnv):
         self._fixed_asset.write_root_velocity_to_sim(fixed_state[:, 7:], env_ids=env_ids)
         self._fixed_asset.reset()
 
+
         # (1.e.) Noisy position observation.
         fixed_asset_pos_noise = torch.randn((len(env_ids), 3), dtype=torch.float32, device=self.device)
         fixed_asset_pos_rand = torch.tensor(self.cfg.obs_rand.fixed_asset_pos, dtype=torch.float32, device=self.device)
@@ -1121,6 +1205,8 @@ class FactoryEnv(DirectRLEnv):
         self.init_fixed_pos_obs_noise[:] = fixed_asset_pos_noise
 
         self.step_sim_no_action()
+
+        # print("fixed_state2",fixed_state)
 
         # Compute the frame on the bolt that would be used as observation: fixed_pos_obs_frame
         # For example, the tip of the bolt can be used as the observation frame
@@ -1138,6 +1224,9 @@ class FactoryEnv(DirectRLEnv):
         )
         self.fixed_pos_obs_frame[:] = fixed_tip_pos
 
+        # fixed_tip_pos 是固定资产的 function point 或者说关键点在世界坐标系下的坐标
+        # print("fixed_tip_pos",fixed_tip_pos)
+
         # (2) Move gripper to randomizes location above fixed asset. Keep trying until IK succeeds.
         # (a) get position vector to target
         bad_envs = env_ids.clone()
@@ -1148,15 +1237,19 @@ class FactoryEnv(DirectRLEnv):
             n_bad = bad_envs.shape[0]
 
             above_fixed_pos = fixed_tip_pos.clone()
+            # 将随机的范围往 z 轴正方向移动一些，确保机械臂初始位置位于 fixed asset 的上方
             above_fixed_pos[:, 2] += self.cfg_task.hand_init_pos[2]
 
             rand_sample = torch.rand((n_bad, 3), dtype=torch.float32, device=self.device)
             above_fixed_pos_rand = 2 * (rand_sample - 0.5)  # [-1, 1]
+            
+            # hand_init_pos_noise 是机械臂初始位置的随机范围
             hand_init_pos_rand = torch.tensor(self.cfg_task.hand_init_pos_noise, device=self.device)
             above_fixed_pos_rand = above_fixed_pos_rand @ torch.diag(hand_init_pos_rand)
             above_fixed_pos[bad_envs] += above_fixed_pos_rand
 
             # (b) get random orientation facing down
+            #　hand_init_orn　是机械臂的初始姿态的随机范围
             hand_down_euler = (
                 torch.tensor(self.cfg_task.hand_init_orn, device=self.device).unsqueeze(0).repeat(n_bad, 1)
             )
@@ -1171,6 +1264,7 @@ class FactoryEnv(DirectRLEnv):
             )
 
             # (c) iterative IK Method
+            # 在确定了初始位置后，需要解IK，确保该位置机械臂可达到
             pos_error, aa_error = self.set_pos_inverse_kinematics(
                 ctrl_target_fingertip_midpoint_pos=above_fixed_pos,
                 ctrl_target_fingertip_midpoint_quat=hand_down_quat,
@@ -1211,6 +1305,7 @@ class FactoryEnv(DirectRLEnv):
 
         # (3) Randomize asset-in-gripper location.
         # flip gripper z orientation
+        # 将机械臂的末端位姿绕z轴翻转180度，可能是因为默认的z轴朝上，这里新的坐标系的z轴应该是朝下
         flip_z_quat = torch.tensor([0.0, 0.0, 1.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1)
         fingertip_flipped_quat, fingertip_flipped_pos = torch_utils.tf_combine(
             q1=self.fingertip_midpoint_quat,
@@ -1220,11 +1315,14 @@ class FactoryEnv(DirectRLEnv):
         )
 
         # get default gripper in asset transform
+        # 当物体被完美抓取时，机械臂指尖相对于物体本身的位置和旋转。
         held_asset_relative_pos, held_asset_relative_quat = self.get_handheld_asset_relative_pose()
+        # 求逆，得到物体相对于机械臂指尖的位置和旋转
         asset_in_hand_quat, asset_in_hand_pos = torch_utils.tf_inverse(
             held_asset_relative_quat, held_asset_relative_pos
         )
 
+        # 计算得到世界坐标系下, head asset 的位姿，head asset 坐标系应该是定义在底部的原点
         translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
             q1=fingertip_flipped_quat, t1=fingertip_flipped_pos, q2=asset_in_hand_quat, t2=asset_in_hand_pos
         )
@@ -1235,14 +1333,50 @@ class FactoryEnv(DirectRLEnv):
         if self.cfg_task.name == "gear_mesh":
             held_asset_pos_noise[:, 2] = -rand_sample[:, 2]  # [-1, 0]
 
+        # 添加 peg 在夹爪内部的位置偏移
         held_asset_pos_noise_level = torch.tensor(self.cfg_task.held_asset_pos_noise, device=self.device)
         held_asset_pos_noise = held_asset_pos_noise @ torch.diag(held_asset_pos_noise_level)
-        translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
-            q1=translated_held_asset_quat,
-            t1=translated_held_asset_pos,
-            q2=torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
-            t2=held_asset_pos_noise,
-        )
+        
+        # ================= NEW: 添加旋转随机化 (30度以内) =================
+        if self.cfg_task.name == "peg_insert": # 只对 Peg in hole 任务添加手内旋转
+            # 2. 生成旋转噪声 (Rotation Noise) - 30度以内
+            rot_noise_deg = 0
+            rot_noise_rad = np.deg2rad(rot_noise_deg)
+            rand_rot_sample = torch.rand((self.num_envs, 3), dtype=torch.float32, device=self.device)
+            held_asset_rpy_noise = 2 * (rand_rot_sample - 0.5) * rot_noise_rad 
+
+            # 转换为四元数
+            
+            held_asset_rot_noise_quat = torch_utils.quat_from_euler_xyz(
+                held_asset_rpy_noise[:, 0], 
+                held_asset_rpy_noise[:, 1], 
+                held_asset_rpy_noise[:, 2]
+            )
+
+            # 3. 第一步结合：将噪声施加到夹爪坐标系上
+            # 这一步得到的是一个“带有误差的夹爪中心位姿”
+            noisy_gripper_quat, noisy_gripper_pos = torch_utils.tf_combine(
+                q1=fingertip_flipped_quat, 
+                t1=fingertip_flipped_pos, 
+                q2=held_asset_rot_noise_quat,   # 在夹爪中心施加旋转
+                t2=held_asset_pos_noise         # 在夹爪中心施加位移
+            )
+
+            # 4. 第二步结合：加上物体相对于夹爪的固定偏移
+            # 因为前一步旋转了坐标系，这一步的偏移向量会跟着旋转，从而实现“绕点旋转”
+            translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
+                q1=noisy_gripper_quat, 
+                t1=noisy_gripper_pos, 
+                q2=asset_in_hand_quat, 
+                t2=asset_in_hand_pos
+            )
+        else:
+            translated_held_asset_quat, translated_held_asset_pos = torch_utils.tf_combine(
+                q1=translated_held_asset_quat,
+                t1=translated_held_asset_pos,
+                q2=torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).unsqueeze(0).repeat(self.num_envs, 1),
+                t2=held_asset_pos_noise,
+            )
 
         held_state = self._held_asset.data.default_root_state.clone()
         held_state[:, 0:3] = translated_held_asset_pos + self.scene.env_origins
